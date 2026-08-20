@@ -1,0 +1,8 @@
+{
+  "bindings": {
+    "source--example-site-6": {}
+  },
+  "dependencies": {
+    "infra--openbase--auth-multi-user--01": {}
+  }
+}

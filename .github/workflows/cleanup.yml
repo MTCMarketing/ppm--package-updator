@@ -1,0 +1,89 @@
+name: Cleanup Action Runs
+
+on:
+  workflow_run:
+    workflows:
+      - "Update PPM Binding Package"
+    types:
+      - completed
+
+permissions:
+  actions: write
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ============================================================
+      # 1. DELETE COMPLETED ACTION RUNS
+      # ============================================================
+
+      - name: Delete completed workflow runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh api \
+            "/repos/$REPO/actions/runs?status=completed&per_page=100" \
+            --paginate \
+            --jq '.workflow_runs[].id' |
+          while read -r RUN_ID; do
+            echo "Deleting run $RUN_ID"
+
+            gh api \
+              --method DELETE \
+              "/repos/$REPO/actions/runs/$RUN_ID"
+          done
+
+
+      # ============================================================
+      # 2. CHECKOUT CURRENT REPOSITORY STATE
+      # ============================================================
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+
+      # ============================================================
+      # 3. REPLACE HISTORY WITH CURRENT STATE
+      # ============================================================
+
+      - name: Delete commit history
+        shell: bash
+        run: |
+          echo "========================================"
+          echo " DELETE COMMIT HISTORY"
+          echo "========================================"
+          echo
+
+          git config user.name "PPM Cleanup"
+          git config user.email "actions@github.com"
+
+          # Create a new branch with no parent/history
+          git checkout --orphan ppm-clean-main
+
+          # Stage the current repository state
+          git add -A
+
+          # Create the new root commit
+          git commit \
+            -m "PPM package executor"
+
+          # Replace main with the new root commit
+          git branch -D main
+          git branch -m main
+
+          # Force the new one-commit history onto GitHub
+          git push \
+            --force \
+            origin main
+
+          echo
+          echo "========================================"
+          echo " COMMIT HISTORY CLEANED"
+          echo "========================================"

@@ -1,0 +1,477 @@
+name: Update PPM Binding Package
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'ppm.package.json'
+
+env:
+  PACKAGE_PREFIX: ppm--
+  NPM_REGISTRY: https://npm.pkg.github.com
+
+jobs:
+  update-ppm-binding:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ============================================================
+      # 1. CHECKOUT
+      # ============================================================
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+
+      # ============================================================
+      # 2. READ LOCAL PPM PACKAGE
+      # ============================================================
+
+      - name: Read PPM package
+        id: ppm
+        shell: bash
+        run: |
+          echo "========================================"
+          echo " PPM PACKAGE"
+          echo "========================================"
+          echo
+
+          jq . ppm.package.json
+
+          echo
+          echo "========================================"
+          echo " BINDING CHECK"
+          echo "========================================"
+          echo
+
+          if ! jq -e '.bindings' ppm.package.json > /dev/null; then
+            echo "Bindings does not exist, cancelling workflow."
+            echo "binding_found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BINDING=$(jq -r '.bindings | keys[0]' ppm.package.json)
+
+          if [ "$BINDING" = "null" ] || [ -z "$BINDING" ]; then
+            echo "Bindings exists but contains no bindings, cancelling workflow."
+            echo "binding_found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Bindings found:"
+          echo
+          echo "  $BINDING"
+
+          echo
+          echo "Grabbing first binding:"
+          echo
+          echo "  $BINDING"
+
+          PREFIXED_BINDING="${PACKAGE_PREFIX}${BINDING}"
+
+          echo
+          echo "Appending PPM prefix:"
+          echo
+          echo "  $PREFIXED_BINDING"
+
+          echo "binding_found=true" >> "$GITHUB_OUTPUT"
+          echo "binding=$BINDING" >> "$GITHUB_OUTPUT"
+          echo "prefixed_binding=$PREFIXED_BINDING" >> "$GITHUB_OUTPUT"
+
+
+      # ============================================================
+      # 3. AUTHENTICATE WITH GITHUB PACKAGES
+      # ============================================================
+
+      - name: Authenticate with GitHub Packages
+        if: steps.ppm.outputs.binding_found == 'true'
+        id: github-packages
+        shell: bash
+        env:
+          PPM_PACKAGES_TOKEN: ${{ secrets.PPM_PACKAGES }}
+        run: |
+          echo
+          echo "========================================"
+          echo " GITHUB PACKAGES AUTHENTICATION"
+          echo "========================================"
+          echo
+
+          if [ -z "$PPM_PACKAGES_TOKEN" ]; then
+            echo "ERROR: PPM_PACKAGES repository secret is unavailable."
+            exit 1
+          fi
+
+          cat > "$RUNNER_TEMP/ppm-npmrc" <<EOF
+          //npm.pkg.github.com/:_authToken=${PPM_PACKAGES_TOKEN}
+          always-auth=true
+          EOF
+
+          chmod 600 "$RUNNER_TEMP/ppm-npmrc"
+
+          SCOPE=$(npm whoami \
+            --registry="$NPM_REGISTRY" \
+            --userconfig="$RUNNER_TEMP/ppm-npmrc")
+
+          SCOPE=$(echo "$SCOPE" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's/^@//')
+
+          echo "@${SCOPE}:registry=${NPM_REGISTRY}" \
+            >> "$RUNNER_TEMP/ppm-npmrc"
+
+          echo "Authenticated successfully."
+          echo
+          echo "GitHub Packages scope:"
+          echo
+          echo "  @$SCOPE"
+
+          echo "scope=$SCOPE" >> "$GITHUB_OUTPUT"
+
+
+      # ============================================================
+      # 4. PULL CURRENT BINDING PACKAGE
+      # ============================================================
+
+      - name: Pull current binding package
+        if: steps.ppm.outputs.binding_found == 'true'
+        id: pull-package
+        shell: bash
+        run: |
+          SCOPE="${{ steps.github-packages.outputs.scope }}"
+          PACKAGE="${{ steps.ppm.outputs.prefixed_binding }}"
+          SCOPED_PACKAGE="@${SCOPE}/${PACKAGE}"
+
+          echo
+          echo "========================================"
+          echo " PULL CURRENT PACKAGE"
+          echo "========================================"
+          echo
+
+          echo "Package:"
+          echo
+          echo "  $SCOPED_PACKAGE"
+          echo
+
+          mkdir -p "$RUNNER_TEMP/ppm-package"
+          cd "$RUNNER_TEMP/ppm-package"
+
+          npm pack "$SCOPED_PACKAGE" \
+            --json \
+            --registry="$NPM_REGISTRY" \
+            --userconfig="$RUNNER_TEMP/ppm-npmrc" \
+            > pack-result.json
+
+          PACKAGE_FILE=$(jq -r '.[0].filename' pack-result.json)
+
+          if [ -z "$PACKAGE_FILE" ] || [ "$PACKAGE_FILE" = "null" ]; then
+            echo "ERROR: Package could not be downloaded."
+            exit 1
+          fi
+
+          tar -xzf "$PACKAGE_FILE"
+
+          echo "Package downloaded and extracted."
+
+
+      # ============================================================
+      # 5. READ CURRENT REMOTE PPM
+      # ============================================================
+
+      - name: Read remote package.ppm.json
+        if: steps.ppm.outputs.binding_found == 'true'
+        shell: bash
+        run: |
+          REMOTE="$RUNNER_TEMP/ppm-package/package/package.ppm.json"
+
+          echo
+          echo "========================================"
+          echo " REMOTE PACKAGE.PPM.JSON"
+          echo "========================================"
+          echo
+
+          if [ ! -f "$REMOTE" ]; then
+            echo "ERROR: package.ppm.json does not exist in package."
+            exit 1
+          fi
+
+          jq . "$REMOTE"
+
+
+      # ============================================================
+      # 6. IDENTITY SAFETY CHECK
+      # ============================================================
+
+      - name: Verify PPM identity
+        if: steps.ppm.outputs.binding_found == 'true'
+        shell: bash
+        run: |
+          LOCAL="$GITHUB_WORKSPACE/ppm.package.json"
+          REMOTE="$RUNNER_TEMP/ppm-package/package/package.ppm.json"
+
+          echo
+          echo "========================================"
+          echo " PPM IDENTITY SAFETY"
+          echo "========================================"
+          echo
+
+          LOCAL_ID=$(jq -r '.id // empty' "$LOCAL")
+          REMOTE_ID=$(jq -r '.id // empty' "$REMOTE")
+
+          echo "Incoming entity ID:"
+          echo
+          echo "  ${LOCAL_ID:-<missing>}"
+
+          echo
+          echo "Existing package ID:"
+          echo
+          echo "  ${REMOTE_ID:-<missing>}"
+
+          echo
+
+          # --------------------------------------------------------
+          # BOTH IDS MUST EXIST
+          # --------------------------------------------------------
+
+          if [ -z "$LOCAL_ID" ]; then
+            echo "ERROR: Incoming ppm.package.json has no id."
+            echo
+            echo "Cannot establish entity identity."
+            echo "Write blocked."
+            exit 1
+          fi
+
+          if [ -z "$REMOTE_ID" ]; then
+            echo "ERROR: Existing package.ppm.json has no id."
+            echo
+            echo "Cannot establish package identity."
+            echo "Write blocked."
+            exit 1
+          fi
+
+          # --------------------------------------------------------
+          # IDS MUST MATCH EXACTLY
+          # --------------------------------------------------------
+
+          if [ "$LOCAL_ID" != "$REMOTE_ID" ]; then
+            echo "ERROR: PPM identity mismatch."
+            echo
+            echo "Incoming entity:"
+            echo "  $LOCAL_ID"
+            echo
+            echo "Existing package:"
+            echo "  $REMOTE_ID"
+            echo
+            echo "These are different PPM entities."
+            echo
+            echo "The existing package WILL NOT be overwritten."
+            echo
+            echo "Write blocked."
+            exit 1
+          fi
+
+          echo "Identity confirmed."
+          echo
+          echo "  $LOCAL_ID == $REMOTE_ID"
+          echo
+          echo "Package replacement is permitted."
+
+
+      # ============================================================
+      # 7. COMPARE LOCAL AND REMOTE PPM
+      # ============================================================
+
+      - name: Compare local and remote PPM
+        if: steps.ppm.outputs.binding_found == 'true'
+        id: compare
+        shell: bash
+        run: |
+          LOCAL="$GITHUB_WORKSPACE/ppm.package.json"
+          REMOTE="$RUNNER_TEMP/ppm-package/package/package.ppm.json"
+
+          echo
+          echo "========================================"
+          echo " PPM COMPARISON"
+          echo "========================================"
+          echo
+
+          jq -S . "$LOCAL" > "$RUNNER_TEMP/local-ppm.json"
+          jq -S . "$REMOTE" > "$RUNNER_TEMP/remote-ppm.json"
+
+          if cmp -s \
+            "$RUNNER_TEMP/local-ppm.json" \
+            "$RUNNER_TEMP/remote-ppm.json"; then
+
+            echo "Files are identical."
+            echo
+            echo "No package update required."
+
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Files are different."
+          echo
+          echo "Package update required."
+          echo
+          echo "Changes:"
+          echo
+
+          diff \
+            --unified \
+            "$RUNNER_TEMP/remote-ppm.json" \
+            "$RUNNER_TEMP/local-ppm.json" || true
+
+          echo
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+
+      # ============================================================
+      # 8. REPLACE package.ppm.json
+      # ============================================================
+
+      - name: Replace package PPM file
+        if: steps.compare.outputs.changed == 'true'
+        shell: bash
+        run: |
+          PACKAGE_DIR="$RUNNER_TEMP/ppm-package/package"
+          LOCAL="$GITHUB_WORKSPACE/ppm.package.json"
+
+          echo
+          echo "========================================"
+          echo " REPLACE PACKAGE.PPM.JSON"
+          echo "========================================"
+          echo
+
+          rm -f "$PACKAGE_DIR/package.ppm.json"
+          cp "$LOCAL" "$PACKAGE_DIR/package.ppm.json"
+
+          echo "Old package.ppm.json replaced."
+          echo
+          echo "New package.ppm.json:"
+          echo
+
+          jq . "$PACKAGE_DIR/package.ppm.json"
+
+
+      # ============================================================
+      # 9. PREPARE NEW PACKAGE VERSION
+      # ============================================================
+
+      - name: Prepare package version
+        if: steps.compare.outputs.changed == 'true'
+        id: version
+        shell: bash
+        run: |
+          PACKAGE_DIR="$RUNNER_TEMP/ppm-package/package"
+
+          echo
+          echo "========================================"
+          echo " PREPARE PACKAGE VERSION"
+          echo "========================================"
+          echo
+
+          cd "$PACKAGE_DIR"
+
+          OLD_VERSION=$(node -p "require('./package.json').version")
+
+          npm version patch \
+            --no-git-tag-version \
+            --allow-same-version=false \
+            > /dev/null
+
+          NEW_VERSION=$(node -p "require('./package.json').version")
+
+          echo "Previous version:"
+          echo
+          echo "  $OLD_VERSION"
+
+          echo
+          echo "New version:"
+          echo
+          echo "  $NEW_VERSION"
+
+          echo "old_version=$OLD_VERSION" >> "$GITHUB_OUTPUT"
+          echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+
+      # ============================================================
+      # 10. BUILD UPDATED PACKAGE
+      # ============================================================
+
+      - name: Build updated package
+        if: steps.compare.outputs.changed == 'true'
+        id: build
+        shell: bash
+        run: |
+          PACKAGE_DIR="$RUNNER_TEMP/ppm-package/package"
+
+          echo
+          echo "========================================"
+          echo " BUILD UPDATED PACKAGE"
+          echo "========================================"
+          echo
+
+          cd "$PACKAGE_DIR"
+
+          npm pack --json > "$RUNNER_TEMP/build-result.json"
+
+          BUILT_PACKAGE=$(jq -r '.[0].filename' \
+            "$RUNNER_TEMP/build-result.json")
+
+          if [ -z "$BUILT_PACKAGE" ] || [ "$BUILT_PACKAGE" = "null" ]; then
+            echo "ERROR: Package build failed."
+            exit 1
+          fi
+
+          echo "Package built:"
+          echo
+          echo "  $BUILT_PACKAGE"
+
+          echo "package_file=$BUILT_PACKAGE" >> "$GITHUB_OUTPUT"
+
+
+      # ============================================================
+      # 11. PUBLISH UPDATED PACKAGE
+      # ============================================================
+
+      - name: Publish updated package
+        if: steps.compare.outputs.changed == 'true'
+        shell: bash
+        run: |
+          PACKAGE_DIR="$RUNNER_TEMP/ppm-package/package"
+          PACKAGE_FILE="${{ steps.build.outputs.package_file }}"
+
+          echo
+          echo "========================================"
+          echo " PUBLISH UPDATED PACKAGE"
+          echo "========================================"
+          echo
+
+          echo "Package:"
+          echo
+          echo "  @${{ steps.github-packages.outputs.scope }}/${{ steps.ppm.outputs.prefixed_binding }}"
+
+          echo
+          echo "Version:"
+          echo
+          echo "  ${{ steps.version.outputs.new_version }}"
+
+          echo
+          echo "Publishing..."
+
+          cd "$PACKAGE_DIR"
+
+          npm publish "$PACKAGE_FILE" \
+            --registry="$NPM_REGISTRY" \
+            --userconfig="$RUNNER_TEMP/ppm-npmrc"
+
+          echo
+          echo "========================================"
+          echo " PACKAGE PUBLISHED SUCCESSFULLY"
+          echo "========================================"
+          echo
+
+          echo "Published:"
+          echo
+          echo "  @${{ steps.github-packages.outputs.scope }}/${{ steps.ppm.outputs.prefixed_binding }}@${{ steps.version.outputs.new_version }}"
